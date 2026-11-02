@@ -20,13 +20,17 @@ from scipy.stats import norm
 from autograd.scipy.special import erf
 
 from ssmdm.DAWDynamics import DAWEmbeddedAccumulationObservations, DAWEmbeddedAccumulationObservationsWithOpto, \
-    DecisionEmbeddedAccumulationObservations, Accumulation1DObservations
-from ssmdm.DAWTransitions import DDMEmbeddedTransitions, DAWAccumulationRaceTransitions, \
-    EmbeddedAccumulationRaceSoftTransitions, AccumulationRaceSoft1DTransitions
-from ssmdm.DAWEmissions import DAWAccumulationPoissonEmissions
+    DecisionEmbeddedAccumulationObservations, Accumulation1DObservations, DAWEmbeddedCascadedAccumulationObservations, \
+        DecisionCascadedAccumulationObservations
+from ssmdm.DAWTransitions import DDMEmbeddedTransitions, \
+    EmbeddedAccumulationRaceSoftTransitions, AccumulationRaceSoft1DTransitions,\
+        EmbeddedCascadedRaceTransitions
+from ssmdm.DAWEmissions import DAWAccumulationPoissonEmissions,EmbeddedCascadedPoissonEmissions
+from ssmdm.DAWDecisionModels import DecisionModel
 from ssm.messages import _kalman_filter, make_lds_parameters
 
 from ssmdm.misc import smooth
+
 
 import copy
 import scipy
@@ -367,6 +371,7 @@ class AccumulationObservations(AutoRegressiveDiagonalNoiseObservations):
     #     self._betas = value
     #     mask = np.vstack((np.eye(self.D)[None,:,:], np.zeros((self.K-1,self.D,self.D))))
     #     self.Vs = self._betas * mask
+
 
     def log_prior(self):
         alpha = 1.1 # or 0.02
@@ -946,7 +951,7 @@ class Accumulation(HMM):
 
         transition_classes = dict(
             racesoft=AccumulationRaceSoftTransitions,
-            dawrace=DAWAccumulationRaceTransitions,
+            #dawrace=DAWAccumulationRaceTransitions,
             race=AccumulationRaceTransitions,
             ddmsoft=DDMSoftTransitions,
             ddm=DDMTransitions,
@@ -1087,6 +1092,39 @@ class AccumulationPoissonEmissions(PoissonEmissions):
         if np.abs(xhat[0]).any()>1.0:
                 xhat[0] = 0.05*npr.randn(1,self.D)
         return xhat
+    
+    ## DAW ADDED -- changed pseudoinverse to be calculated with np.linal.pinv instead of np.linalg.solve
+    # Helps immensely for keeping neg_hessian_log_joint finite
+    def _invert(self, data, input=None, mask=None, tag=None):
+        """
+        Approximate invert the linear emission model with the pseudoinverse
+
+        y = Cx + d + noise; C orthogonal.
+        xhat = (C^T C)^{-1} C^T (y-d)
+        """
+        # Invert with the average emission parameters
+        C = np.mean(self.Cs, axis=0)
+        F = np.mean(self.Fs, axis=0)
+        d = np.mean(self.ds, axis=0)
+        C_pseudoinv = np.linalg.pinv(C).T
+        #C_pseudoinv = np.linalg.solve(C.T.dot(C), C.T).T
+
+        # Account for the bias
+        if input is not None:
+            bias = input.dot(F.T) + d
+        else:
+            bias = d
+
+        if not np.all(mask):
+            data = interpolate_data(data, mask)
+            # We would like to find the PCA coordinates in the face of missing data
+            # To do so, alternate between running PCA and imputing the missing entries
+            for itr in range(25):
+                mu = (data - bias).dot(C_pseudoinv)
+                data[:, ~mask[0]] = (mu.dot(C.T) + bias)[:, ~mask[0]]
+
+        # Project data to get the mean
+        return (data - bias).dot(C_pseudoinv)
     
     # def log_likelihoods(self, data, input, mask, tag, x):
     #     assert data.dtype == int
@@ -1249,7 +1287,6 @@ class LatentAccumulation(SLDS):
         transition_classes = dict(
             racesoft=AccumulationRaceSoftTransitions,
             racesoft1d=AccumulationRaceSoft1DTransitions,
-            dawrace=DAWAccumulationRaceTransitions,
             race=AccumulationRaceTransitions,
             ddmsoft=DDMSoftTransitions,
             ddm=DDMTransitions,
@@ -1257,7 +1294,8 @@ class LatentAccumulation(SLDS):
             ddmnlncollapsing=DDMNonlinearCollapsingTransitions,
             embedded_ddm=DDMEmbeddedTransitions,
             embedded_race=EmbeddedAccumulationRaceTransitions,
-            embedded_racesoft=EmbeddedAccumulationRaceSoftTransitions)
+            embedded_racesoft=EmbeddedAccumulationRaceSoftTransitions,
+            embeddedcascaded=EmbeddedCascadedRaceTransitions)
         self.transitions_label = transitions
         self.transition_kwargs = transition_kwargs
         transition_kwargs = transition_kwargs or {}
@@ -1272,6 +1310,8 @@ class LatentAccumulation(SLDS):
             dawembeddedopto=DAWEmbeddedAccumulationObservationsWithOpto,
             decisionembedded=DecisionEmbeddedAccumulationObservations,
             acc1d=Accumulation1DObservations,
+            embeddedcascaded=DAWEmbeddedCascadedAccumulationObservations,
+            decisioncascaded=DecisionCascadedAccumulationObservations,
         )
         dynamics_kwargs = dynamics_kwargs or {}
         self.dynamics_kwargs = dynamics_kwargs
@@ -1282,17 +1322,22 @@ class LatentAccumulation(SLDS):
             gaussian=AccumulationGaussianEmissions,
             poisson=AccumulationPoissonEmissions,
             rampstep=RampStepPoissonEmissions,
-            dawpoisson=DAWAccumulationPoissonEmissions)#,
+            dawpoisson=DAWAccumulationPoissonEmissions,
+            embeddedcascaded=EmbeddedCascadedPoissonEmissions)#,
             # calcium=AccumulationCalciumEmissions)
         emission_kwargs = emission_kwargs or {}
         emissions = emission_classes[emissions](N, K, D, M=M,
             single_subspace=single_subspace, **emission_kwargs)
-
+        
         super().__init__(N, K=K, D=D, M=M,
                             init_state_distn=init_state_distn,
                             transitions=transitions,
                             dynamics=dynamics,
                             emissions=emissions)
+        if dynamics_kwargs is not None and 'D_acc' in dynamics_kwargs:
+            self.decisions = DecisionModel(dynamics_kwargs['D_acc'],D)
+        else:
+            self.decisions = DecisionModel(D)
 
     @ensure_args_are_lists
     def initialize(self, datas, inputs=None, masks=None, tags=None,
