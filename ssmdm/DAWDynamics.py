@@ -646,7 +646,12 @@ class DecisionEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObserv
         self.dt = 0.02
         self.epsilon = 10e-10;
         self.total_rate = 30;
-        self.sigma_decision = 0.1*np.eye(self.D)
+        
+        # Initialize decision model for the final decision stage
+        self.sig_dec = sig_dec
+        decdims = [(d+1) * self.cascades - 1 for d in range(self.D_acc)]
+        self.decisions = DecisionModel(self.D_acc,self.D,self.sig_dec, decdims)
+        
 
         # diagonal dynamics for each state
         # only learn accumulation dynamics for accumulation state
@@ -669,36 +674,6 @@ class DecisionEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObserv
         mask2 = np.vstack( (np.zeros((1,D,D)), np.tile(Adecstate,(K-1,1,1)) ))
         self._As = mask1 + mask2
         
-        # if D_acc > 1:
-        #     # set input Accumulation params, one for each dimension
-        #     # first D inputs are accumulated in different dimensions
-        #     # rest of M-D inputs are applied to each dimension
-        #     ### This is original, for first D_acc dims
-        #     # self._betas = 0.1*np.ones(D_acc,)
-        #     # r1 = self._betas*np.eye(D_acc, D_acc)
-        #     # r2 = np.zeros((self.D_emb, M)) # is D_emb rows by input # of columns 
-        #     # self.Vs[0] = np.vstack((r1, r2))
-        #     ### This is new, for all dims
-        #     self._betas = 0.1 * np.ones(M,)
-        #     self._betas_emb = 0.1 * np.ones(D_emb*M,)
-        #     r1 = self._betas*np.eye(D_acc, M)
-        #     r2 = np.reshape(self._betas_emb,(D_emb,M))
-        #     k1 = np.vstack((r1[None,:,:], np.zeros((K-1,D_acc,M))))
-        #     #k2 = np.tile(r2[None,:,:],(K,1,1))
-        #     k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
-        #     self.Vs = np.concatenate([k1,k2],axis=1)
-        # else:
-        #     # set input Accumulation params, each Mphys inputs are accumulated on one
-        #     # dimension in opposite directions
-        #     # rest of M-D inputs are applied to each dimension
-        #     self._betas = np.array([0.1,-0.1])*np.ones(Mphys,)
-        #     self._betas_emb = 0.1 * np.ones(D_emb*M,)
-        #     r1 = np.hstack((self._betas[None,:],np.zeros((1,M-Mphys))))
-        #     r2 = np.reshape(self._betas_emb,(D_emb,M))
-        #     k1 = np.vstack((r1[None,:], np.zeros((K-1,D_acc,M))))
-        #     #k2 = np.tile(r2[None,:,:],(K,1,1))
-        #     k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
-        #     self.Vs = np.concatenate([k1,k2],axis=1)
             
         # Free parameter for all state x input combinations
         self._betas = 0.1 * np.ones(D_acc*M,)
@@ -817,25 +792,7 @@ class DecisionEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObserv
     def initialize(self, datas, inputs=None, masks=None, tags=None):
         pass
     
-    def decision_to_latent(self, decision, sigma=0.1, target_value=1.0, baseline=0.0):
-        """
-        Convert binary decision into a latent target in R^2 space.
-    
-        Args:
-            decision: int, 0 or 1
-            sigma: how confident you are in this endpoint (smaller = stronger pull)
-            target_value: the desired activation of the chosen latent dim
-            baseline: the "null" activation of the unchosen dim
-    
-        Returns:
-            x_T: np.array of shape (2,) — target latent mean at final time
-        """
-        x_T = np.full(self.D, baseline)
-        x_T[decision] = target_value
-        return x_T
-
-    
-    
+  
     
     # def _compute_mus(self, data, input, mask, tag):
     #     K, M = self.K, self.M
@@ -916,48 +873,12 @@ class DecisionEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObserv
             stats.multivariate_normal_logpdf(data[L:], mu[L:], Sigma)
             for mu, Sigma in zip(mus, self.Sigmas)
         ])
-        
+
         # Choice likelihood
-        if tag is not None:
-            # decision = tag # expected to be 0 or 1
-            # wT = 1 if decision == 0 else -1
-            # H =np.array( [1,-1,0,0])
-            # logP_dec = np.log(1/np.sqrt(2*np.pi*self.sigma_decision**2))-1/2*(wT-mus[:,-1] @ H)*1/self.sigma_decision**2*wT-mus[:,-1] @ H   
-            # ll_dec = np.zeros((ll_ar.shape[0]-1,ll_ar.shape[1]))
-            # ll_decision = np.row_stack((ll_dec,logP_dec))
-          
-            wt = []
-            for d in range(self.D):
-                if d == tag:
-                    wt.append(1)
-                else:
-                    wt.append(0)
-            wT = np.array(wt)[:,None]
-            # H = np.zeros((self.D,self.D))
-            # H[0,0] = 1
-            # H[1,1] = 1
-            h1 = np.eye(self.D_acc,self.D)
-            h2 = np.zeros((self.D_emb,self.D))
-            H = np.vstack((h1,h2))
-            
-            logP_dec = np.array([np.squeeze(np.log(2*np.pi**(-D/2)*np.linalg.det(self.sigma_decision)) -\
-                0.5*(wT- (H @ mu[-1])[:,None]).T @ np.linalg.inv(self.sigma_decision) @ (wT- (H @ mu[-1])[:,None])) \
-                for mu in mus])[None,:]
-            ll_dec = np.zeros((ll_ar.shape[0]-1,ll_ar.shape[1]))
-            ll_decision = np.row_stack((ll_dec,logP_dec))
-            # delta = mus[:,-1,0]-mus[:,-1,1]
-            # z = delta / (np.sqrt(2) * self.sigma_decision)
-            # prob = 0.5 * (1 + erf(z))
-            # # Avoid log(0)
-            # eps = 1e-12
-            # prob = np.clip(prob, eps, 1 - eps)
-            # ll_decision = np.log(prob) if decision == 0 else np.log(1 - prob)
-            
-            
-            ll = np.row_stack((ll_init, ll_ar + ll_decision))  # shape (T, K)
-        else:
-            ll = np.row_stack((ll_init, ll_ar))
+        ll_decision = self.decisions.log_likelihoods(mus, input, mask, tag)
         
+        ll = np.row_stack((ll_init, ll_ar)) + ll_decision  # shape (T, K)
+       
         return ll
     
     def neg_hessian_expected_log_dynamics_prob(self, Ez, data, input, mask, tag=None):
@@ -978,12 +899,9 @@ class DecisionEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObserv
         J_dyn_22 = np.sum(Ez[1:,:,None,None] * inv_Sigmas[None,:], axis=1)
         
         # # Add final J for decision
-        h1 = np.eye(self.D_acc,self.D)
-        h2 = np.zeros((self.D_emb,self.D))
-        H = np.vstack((h1,h2))
-        
-        blocks = np.array([-1.0 * H @ np.linalg.inv(self.sigma_decision) @ H
-                            for _ in range(self.K)])
+        Hs = np.array([self.decisions.H for _ in range(self.K)])
+        blocks = np.array([-1.0 * H @ np.linalg.inv(self.decisions.sigma_decision) @ H
+                            for H in Hs])
         J_dec = np.sum(Ez[-1,:,None,None] * blocks, axis=0)
         J_dyn_22[-1] += -J_dec
 
@@ -994,44 +912,7 @@ class DecisionEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObserv
         
         return J_ini, J_dyn_11, J_dyn_21, J_dyn_22
     
-    def Rchoice_likelihood(self,x,q_Sigmas):
-        # ll_decision = np.row_stack((ll_dec,logP_dec))
-        # wTR = np.array([0,1,0,0])[:,None]
-        # wTL = np.array([1,0,0,0])[:,None]
-        
-        wT = np.eye(self.D_acc,self.D)
-        wTL = wT[0,:,None]
-        wTR = wT[1,:,None]
-        # H = np.zeros((self.D,self.D))
-        # H[0,0] = 1
-        # H[1,1] = 1
-        h1 = np.eye(self.D_acc,self.D)
-        h2 = np.zeros((self.D_emb,self.D))
-        H = np.vstack((h1,h2))
-        
-        P_R = 2*np.pi**(-self.D/2)*np.linalg.det(self.sigma_decision) *\
-            np.exp(-0.5*(wTR - (H @ x[-1])[:,None]).T @ np.linalg.inv(self.sigma_decision) @ (wTR - (H @ x[-1])[:,None]))
-            
-        P_L = 2*np.pi**(-self.D/2)*np.linalg.det(self.sigma_decision) *\
-            np.exp(-0.5*(wTL - (H @ x[-1])[:,None]).T @ np.linalg.inv(self.sigma_decision) @ (wTL - (H @ x[-1])[:,None]))
-        
-        prob = P_R/(P_R+P_L)
-        return prob
-        # q_stds = np.array([np.sqrt(np.diag(q_Sigma)) for q_Sigma in q_Sigmas])
-        # delta = x[-1,0]-x[-1,1]
-        # z = delta / (np.sqrt(q_stds[-1,0]*q_stds[-1,1]))
-        # prob = 0.5 * (1 + erf(z))
-        # # Avoid log(0)
-        # eps = 1e-12
-        # prob = np.clip(prob, eps, 1 - eps)
-        # return 1-prob
-    
-    def Rchoice_likelihoods(self,xs,q_Sigmass):
-        prob = np.zeros((len(xs),))
-        for i,(x,q_Sigmas) in enumerate(zip(xs,q_Sigmass)):
-            prob[i] = self.Rchoice_likelihood(x,q_Sigmas[2])
-            
-        return prob
+  
     # def log_likelihoods(self, data, input, mask, tag):
     #     L = self.lags
     #     T, D = data.shape
