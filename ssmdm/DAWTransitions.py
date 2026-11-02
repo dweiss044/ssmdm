@@ -76,64 +76,6 @@ class DDMEmbeddedTransitions(RecurrentTransitions):
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
         pass
     
-class DAWAccumulationRaceTransitions(RecurrentOnlyTransitions):
-    def __init__(self, K, D, M=0, scale=100, D_acc=None, D_emb=None):
-        assert K == D+1
-        #assert K == D_acc+1
-        # assert D_acc >= 1
-        # assert D_acc + D_emb == D
-        super(DAWAccumulationRaceTransitions, self).__init__(K, D, M)
-
-        # "Race" transitions with D+1 states
-        # Transition to state d when x_d > 1.0
-        # State 0 is the accumulation state
-        # scale determines sharpness of the threshold
-        # Transitions out of boundary states occur w/ very low probability
-        # top_row = np.concatenate(([0.0],-scale*np.ones(D)))
-        # rest_rows = np.hstack((-scale*np.ones((D,1)),-scale*np.ones((D,D)) + np.diag(2.0*scale*np.ones(D))))
-        # self.log_Ps = np.vstack((top_row,rest_rows))
-        self.Ws = np.zeros((K,M))
-        self.Rs = np.vstack((np.zeros(D),scale*np.eye(D)))
-        # R1 = np.vstack((np.zeros(D_acc),scale*np.eye(D_acc)))
-        # R2 = np.zeros((K, D_emb))
-        # self.Rs = np.hstack((R1, R2))
-        self.r = np.concatenate(([0],-scale*np.ones(K-1)))
-
-    @property
-    def params(self):
-        return ()
-
-    @params.setter
-    def params(self, value):
-        pass
-    
-    
-    # def log_transition_matrices(self, data, input, mask, tag):
-    #     # Clip latent for numerically stable transitions
-    #     data = np.clip(data, -0.95, 0.95)
-    #     log_Ps = np.dot(input[1:], self.Ws.T)[:, None, :]              # inputs
-    #     log_Ps = log_Ps + np.dot(data[:-1], self.Rs.T)[:, None, :]     # past observations
-    #     log_Ps = log_Ps + self.r                                       # bias
-    #     log_Ps = np.tile(log_Ps, (1, self.K, 1))                       # expand
-    #     return log_Ps - logsumexp(log_Ps, axis=2, keepdims=True)       # normalize
-    
-    # def neg_hessian_expected_log_trans_prob(self, data, input, mask, tag, expected_joints):
-    #     # Clip latent for numerically stable transitions
-    #     data = np.clip(data, -0.95, 0.95)
-    #     # Return (T-1, D, D) array of blocks for the diagonal of the Hessian
-    #     v = np.dot(input[1:], self.Ws.T) + np.dot(data[:-1], self.Rs.T) + self.r
-    #     shifted_exp = np.exp(v - np.max(v,axis=1,keepdims=True))
-    #     vtilde = shifted_exp / np.sum(shifted_exp,axis=1,keepdims=True) # normalized probabilities
-    #     Rv = vtilde@self.Rs
-    #     hess = np.einsum('tn, ni, nj ->tij', -vtilde, self.Rs, self.Rs) \
-    #            + np.einsum('ti, tj -> tij', Rv, Rv)
-    #     return -1 * hess
-
-    def initialize(self, datas, inputs=None, masks=None, tags=None):
-        pass
-
-    def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
-        pass
     
 class EmbeddedAccumulationRaceSoftTransitions(RecurrentOnlyTransitions):
     def __init__(self, K, D, M=0, scale=200, D_acc=None, D_emb=None):
@@ -212,6 +154,60 @@ class AccumulationRaceSoft1DTransitions(RecurrentOnlyTransitions):
     @params.setter
     def params(self, value):
         pass
+
+    def initialize(self, datas, inputs=None, masks=None, tags=None):
+        pass
+
+    def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
+        pass
+    
+class EmbeddedCascadedRaceTransitions(RecurrentTransitions):
+    def __init__(self, K, D, M=0, scale=200, D_acc=None, D_emb=None, cascades=1):
+        self.cascades = cascades
+        self.D_acc_total = D_acc * cascades
+        assert K == D_acc + 1
+        assert D_acc >= 1
+        assert self.D_acc_total + D_emb == D
+        super(EmbeddedCascadedRaceTransitions, self).__init__(K, D, M)
+
+        # "Race" transitions with D_acc + 1 states (K states total)
+        # State 0 is the accumulation state
+        # States 1 to D_acc are decision states triggered when accumulator d reaches threshold
+        # scale determines the sharpness of the threshold
+        top_row = np.concatenate(([0.0], -scale * np.ones(D_acc)))
+        rest_rows = np.hstack((
+            -scale * np.ones((D_acc, 1)), 
+            -scale * np.ones((D_acc, D_acc)) + np.diag(2.0 * scale * np.ones(D_acc))
+        ))
+        self.log_Ps = np.vstack((top_row, rest_rows))
+        self.Ws = np.zeros((K, M))
+
+        # Map the race transition weights (Rs) to look at the FINAL stage 
+        # of each accumulator cascade channel (indices: cascades-1, 2*cascades-1, etc.)
+        R1 = np.zeros((K, self.D_acc_total))
+        for d in range(D_acc):
+            final_stage_idx = (d + 1) * cascades - 1
+            R1[d + 1, final_stage_idx] = scale
+
+        # Embedded dimensions do not directly trigger race transitions
+        R2 = np.zeros((K, D_emb))
+        self.Rs = np.hstack((R1, R2))
+
+    @property
+    def params(self):
+        return ()
+
+    @params.setter
+    def params(self, value):
+        pass
+    
+    # def log_transition_matrices(self, data, input, mask, tag):
+    #     # Clip latent for numerically stable transitions
+    #     data = np.clip(data, -1, 1)
+    #     log_Ps = np.dot(input[1:], self.Ws.T)[:, None, :]              # inputs
+    #     log_Ps = log_Ps + np.dot(data[:-1], self.Rs.T)[:, None, :]    # past observations
+    #     log_Ps = np.tile(log_Ps, (1, self.K, 1))                      # expand
+    #     return log_Ps - logsumexp(log_Ps, axis=2, keepdims=True)      # normalize
 
     def initialize(self, datas, inputs=None, masks=None, tags=None):
         pass

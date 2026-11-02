@@ -39,6 +39,8 @@ from autograd.tracer import getval
 from autograd.misc import flatten
 from autograd import value_and_grad
 
+from ssmdm.DAWDecisionModels import DecisionModel 
+
 class DAWEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObservations):
     def __init__(self, K, D, M, lags=1, D_emb=None, D_acc=None, Mphys=2,learn_V=True):
         super().__init__(K, D, M)
@@ -67,11 +69,16 @@ class DAWEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObservation
         
         # (M @ A)v = (M @ \lambda)v
         
+        # Initialize with stable diagonal eigenvalues of embedded dimensions
         self._a_emb = np.random.uniform(low=0.9,high=0.95,size=(D_emb,))*np.eye(D_emb) #@ random_rotation(D_emb)
+        # Accumulation state has learnable diagonal dynamics on 
+        # accumulation dimensions and learnable diagonal dynamics on embedded dimensions
         top_rows = np.hstack((self._a_diag*np.eye(D_acc),np.zeros((D_acc,D_emb))))
         bottom_rows = np.hstack((np.zeros((D_emb,D_acc)),self._a_emb))
         Aaccstate = np.vstack((top_rows,bottom_rows))
         
+        # Decision states have no dynamics on accumulation dims but do have
+        # (Identical) dynamics on embedded dims
         top_rows = np.hstack((np.eye(D_acc),np.zeros((D_acc,D_emb))))
         Adecstate = np.vstack((top_rows,bottom_rows))
         
@@ -79,29 +86,28 @@ class DAWEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObservation
         mask2 = np.vstack( (np.zeros((1,D,D)), np.tile(Adecstate,(K-1,1,1)) ))
         self._As = mask1 + mask2
         
+        # Free parameter for all state x input combinations
+        self._betas = 0.1 * np.ones(D_acc*M,)
+        self._betas_emb = 0.1 * np.ones(D_emb*M,)
+        
+        # For multiple accumulators, independent input channels don't interact
         if D_acc > 1:
-            
-            ### This is new, for all dims
-            self._betas = 0.1 * np.ones(M,)
-            self._betas_emb = 0.1 * np.ones(D_emb*M,)
-            r1 = self._betas*np.eye(D_acc, M)
-            r2 = np.reshape(self._betas_emb,(D_emb,M))
-            k1 = np.vstack((r1[None,:,:], np.zeros((K-1,D_acc,M))))
-            #k2 = np.tile(r2[None,:,:],(K,1,1))
-            k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
-            self.Vs = np.concatenate([k1,k2],axis=1)
+            mask1 = np.hstack((np.eye(D_acc),np.ones((D_acc,M-self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc,D_acc)),np.ones((D_acc,M-self.Mphys))))
         else:
-            # set input Accumulation params, each Mphys inputs are accumulated on one
-            # dimension in opposite directions
-            # rest of M-D inputs are applied to each dimension
-            self._betas = np.array([0.1,-0.1])*np.ones(Mphys,)
-            self._betas_emb = 0.1 * np.ones(D_emb*M,)
-            r1 = np.hstack((self._betas[None,:],np.zeros((1,M-Mphys))))
-            r2 = np.reshape(self._betas_emb,(D_emb,M))
-            k1 = np.vstack((r1[None,:], np.zeros((K-1,D_acc,M))))
-            #k2 = np.tile(r2[None,:,:],(K,1,1))
-            k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
-            self.Vs = np.concatenate([k1,k2],axis=1)
+            mask1 = np.hstack((np.ones((D_acc,self.Mphys)),np.ones((D_acc,M-self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc,self.Mphys)),np.ones((D_acc,M-self.Mphys))))
+        r1 = np.reshape(self._betas,(D_acc,M)) * mask1
+        
+        # Accumulator no longer affected by physical inputs 
+        # once decision state is reached
+        
+        k1 = np.vstack((r1[None,:,:], (r1*mask2)[None,:,:], (r1*mask2)[None,:,:]))
+        r2 = np.reshape(self._betas_emb,(D_emb,M))
+        
+        # Embedded dynamics are unaffected by regime change
+        k2 = np.tile(r2[None,:,:],(K,1,1))
+        self.Vs = np.concatenate([k1,k2],axis=1)
 
         # self.Vs[0] = np.vstack((r1, r2))
 
@@ -135,32 +141,34 @@ class DAWEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObservation
         K, D, M, D_acc, D_emb = self.K, self.D, self.M, self.D_acc, \
             self.D_emb
 
-        # Update V
-        ### This is original, for first D_acc dims
-        # k1 = np.vstack((self._betas * np.eye(self.D_acc), np.zeros((self.D_emb,self.D_acc)))) # state K = 0
-        # self.Vs = np.vstack((k1[None,:,:], np.zeros((K-1,D,M))))
-        ### This is new, for all dims
-        # k1 = self._betas * np.eye(self.D, self.M)
-        # self.Vs = np.vstack((k1[None,:,:], np.zeros((K-1,D,M))))
+        # physical stimuli effect one accumulation state but not any other
+        # physical stimuli no longer affect accumulators in decision regime
+        # Additional inputs affect all states, but is the same across regimes
         
-        # Update V
         if D_acc > 1:
-            r1 = self._betas*np.eye(D_acc, M)
-            k1 = np.vstack((r1[None,:,:], np.zeros((K-1,D_acc,M))))
-            r2 = np.reshape(self._betas_emb,(D_emb,M))
-            #k2 = np.tile(r2[None,:,:],(K,1,1))
-            k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
-            self.Vs = np.concatenate([k1,k2],axis=1)
+            mask1 = np.hstack((np.eye(D_acc),np.ones((D_acc,M-self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc,D_acc)),np.ones((D_acc,M-self.Mphys))))
         else:
-            # set input Accumulation params, each Mphys inputs are accumulated on one
-            # dimension in opposite directions
-            # rest of M-D inputs are applied to each dimension
-            r1 = np.hstack((self._betas,np.zeros((1,M-self.Mphys))))
-            r2 = np.reshape(self._betas_emb,(D_emb,M))
-            k1 = np.vstack((r1[None,:,:], np.zeros((K-1,D_acc,M))))
-            #k2 = np.tile(r2[None,:,:],(K,1,1))
-            k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
-            self.Vs = np.concatenate([k1,k2],axis=1)
+            mask1 = np.hstack((np.ones((D_acc,self.Mphys)),np.ones((D_acc,M-self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc,self.Mphys)),np.ones((D_acc,M-self.Mphys))))
+        r1 = np.reshape(self._betas,(D_acc,M)) * mask1
+        k1 = np.vstack((r1[None,:,:], (r1*mask2)[None,:,:], (r1*mask2)[None,:,:]))
+        r2 = np.reshape(self._betas_emb,(D_emb,M))
+        
+        k2 = np.tile(r2[None,:,:],(K,1,1))
+        #k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
+        self.Vs = np.concatenate([k1,k2],axis=1)
+            
+        # else:
+        #     # set input Accumulation params, each Mphys inputs are accumulated on one
+        #     # dimension in opposite directions
+        #     # rest of M-D inputs are applied to each dimension
+        #     r1 = np.hstack((self._betas,np.zeros((1,M-self.Mphys))))
+        #     r2 = np.reshape(self._betas_emb,(D_emb,M))
+        #     k1 = np.vstack((r1[None,:,:], np.zeros((K-1,D_acc,M))))
+        #     #k2 = np.tile(r2[None,:,:],(K,1,1))
+        #     k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
+        #     self.Vs = np.concatenate([k1,k2],axis=1)
        
         
 
@@ -243,7 +251,7 @@ class DAWEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObservation
 
 
 class DAWEmbeddedAccumulationObservationsWithOpto(AutoRegressiveDiagonalNoiseObservations):
-    def __init__(self, K, D, M, lags=1, D_emb=None, D_acc=None, Mphys=None, Mopto=None,learn_V=True):
+    def __init__(self, K, D, M, lags=1, D_emb=None, D_acc=None, Mphys=None,learn_V=True):
         super().__init__(K, D, M)
 
         assert D_emb + D_acc == D, "accum + emb dims must equal total dims"
@@ -253,7 +261,7 @@ class DAWEmbeddedAccumulationObservationsWithOpto(AutoRegressiveDiagonalNoiseObs
         self.D_emb = D_emb
         self.D = D_acc + D_emb
         self.Mphys = Mphys
-        self.Mopto = Mopto
+        self.Mopto = M - Mphys
         self.M = M
         self.K = K
         
@@ -622,7 +630,7 @@ class DAWEmbeddedAccumulationObservationsWithOpto(AutoRegressiveDiagonalNoiseObs
         Observations.m_step(self, expectations, datas, inputs, masks, tags, **kwargs)
         
 class DecisionEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObservations):
-    def __init__(self, K, D, M, lags=1, D_emb=None, D_acc=None,Mphys=2,learn_V=True):
+    def __init__(self, K, D, M, lags=1, D_emb=None, D_acc=None,Mphys=2,sig_dec=0.1,learn_V=True):
         super().__init__(K, D, M)
 
         assert D_emb + D_acc == D, "accum + emb dims must equal total dims"
@@ -661,36 +669,58 @@ class DecisionEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObserv
         mask2 = np.vstack( (np.zeros((1,D,D)), np.tile(Adecstate,(K-1,1,1)) ))
         self._As = mask1 + mask2
         
+        # if D_acc > 1:
+        #     # set input Accumulation params, one for each dimension
+        #     # first D inputs are accumulated in different dimensions
+        #     # rest of M-D inputs are applied to each dimension
+        #     ### This is original, for first D_acc dims
+        #     # self._betas = 0.1*np.ones(D_acc,)
+        #     # r1 = self._betas*np.eye(D_acc, D_acc)
+        #     # r2 = np.zeros((self.D_emb, M)) # is D_emb rows by input # of columns 
+        #     # self.Vs[0] = np.vstack((r1, r2))
+        #     ### This is new, for all dims
+        #     self._betas = 0.1 * np.ones(M,)
+        #     self._betas_emb = 0.1 * np.ones(D_emb*M,)
+        #     r1 = self._betas*np.eye(D_acc, M)
+        #     r2 = np.reshape(self._betas_emb,(D_emb,M))
+        #     k1 = np.vstack((r1[None,:,:], np.zeros((K-1,D_acc,M))))
+        #     #k2 = np.tile(r2[None,:,:],(K,1,1))
+        #     k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
+        #     self.Vs = np.concatenate([k1,k2],axis=1)
+        # else:
+        #     # set input Accumulation params, each Mphys inputs are accumulated on one
+        #     # dimension in opposite directions
+        #     # rest of M-D inputs are applied to each dimension
+        #     self._betas = np.array([0.1,-0.1])*np.ones(Mphys,)
+        #     self._betas_emb = 0.1 * np.ones(D_emb*M,)
+        #     r1 = np.hstack((self._betas[None,:],np.zeros((1,M-Mphys))))
+        #     r2 = np.reshape(self._betas_emb,(D_emb,M))
+        #     k1 = np.vstack((r1[None,:], np.zeros((K-1,D_acc,M))))
+        #     #k2 = np.tile(r2[None,:,:],(K,1,1))
+        #     k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
+        #     self.Vs = np.concatenate([k1,k2],axis=1)
+            
+        # Free parameter for all state x input combinations
+        self._betas = 0.1 * np.ones(D_acc*M,)
+        self._betas_emb = 0.1 * np.ones(D_emb*M,)
+        
+        # For multiple accumulators, independent input channels don't interact
         if D_acc > 1:
-            # set input Accumulation params, one for each dimension
-            # first D inputs are accumulated in different dimensions
-            # rest of M-D inputs are applied to each dimension
-            ### This is original, for first D_acc dims
-            # self._betas = 0.1*np.ones(D_acc,)
-            # r1 = self._betas*np.eye(D_acc, D_acc)
-            # r2 = np.zeros((self.D_emb, M)) # is D_emb rows by input # of columns 
-            # self.Vs[0] = np.vstack((r1, r2))
-            ### This is new, for all dims
-            self._betas = 0.1 * np.ones(M,)
-            self._betas_emb = 0.1 * np.ones(D_emb*M,)
-            r1 = self._betas*np.eye(D_acc, M)
-            r2 = np.reshape(self._betas_emb,(D_emb,M))
-            k1 = np.vstack((r1[None,:,:], np.zeros((K-1,D_acc,M))))
-            #k2 = np.tile(r2[None,:,:],(K,1,1))
-            k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
-            self.Vs = np.concatenate([k1,k2],axis=1)
+            mask1 = np.hstack((np.eye(D_acc),np.ones((D_acc,M-self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc,D_acc)),np.ones((D_acc,M-self.Mphys))))
         else:
-            # set input Accumulation params, each Mphys inputs are accumulated on one
-            # dimension in opposite directions
-            # rest of M-D inputs are applied to each dimension
-            self._betas = np.array([0.1,-0.1])*np.ones(Mphys,)
-            self._betas_emb = 0.1 * np.ones(D_emb*M,)
-            r1 = np.hstack((self._betas[None,:],np.zeros((1,M-Mphys))))
-            r2 = np.reshape(self._betas_emb,(D_emb,M))
-            k1 = np.vstack((r1[None,:], np.zeros((K-1,D_acc,M))))
-            #k2 = np.tile(r2[None,:,:],(K,1,1))
-            k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
-            self.Vs = np.concatenate([k1,k2],axis=1)
+            mask1 = np.hstack((np.ones((D_acc,self.Mphys)),np.ones((D_acc,M-self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc,self.Mphys)),np.ones((D_acc,M-self.Mphys))))
+        r1 = np.reshape(self._betas,(D_acc,M)) * mask1
+        
+        # Accumulator no longer affected by physical inputs 
+        # once decision state is reached
+        k1 = np.vstack((r1[None,:,:], (r1*mask2)[None,:,:], (r1*mask2)[None,:,:]))
+        r2 = np.reshape(self._betas_emb,(D_emb,M))
+        
+        # Embedded dynamics are unaffected by regime change
+        k2 = np.tile(r2[None,:,:],(K,1,1))
+        self.Vs = np.concatenate([k1,k2],axis=1)
 
         # self.Vs[0] = np.vstack((r1, r2))
 
@@ -724,26 +754,40 @@ class DecisionEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObserv
         K, D, M, D_acc, D_emb = self.K, self.D, self.M, self.D_acc, \
             self.D_emb
 
-        # Update V
+        # # Update V
+        # if D_acc > 1:
+        #     r1 = self._betas*np.eye(D_acc, M)
+        #     k1 = np.vstack((r1[None,:,:], np.zeros((K-1,D_acc,M))))
+        #     r2 = np.reshape(self._betas_emb,(D_emb,M))
+        #     #k2 = np.tile(r2[None,:,:],(K,1,1))
+        #     k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
+        #     self.Vs = np.concatenate([k1,k2],axis=1)
+        # else:
+        #     # set input Accumulation params, each Mphys inputs are accumulated on one
+        #     # dimension in opposite directions
+        #     # rest of M-D inputs are applied to each dimension
+        #     r1 = np.hstack((self._betas,np.zeros((1,M-self.Mphys))))
+        #     r2 = np.reshape(self._betas_emb,(D_emb,M))
+        #     k1 = np.vstack((r1[None,:,:], np.zeros((K-1,D_acc,M))))
+        #     #k2 = np.tile(r2[None,:,:],(K,1,1))
+        #     k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
+        #     self.Vs = np.concatenate([k1,k2],axis=1)
+        
         if D_acc > 1:
-            r1 = self._betas*np.eye(D_acc, M)
-            k1 = np.vstack((r1[None,:,:], np.zeros((K-1,D_acc,M))))
-            r2 = np.reshape(self._betas_emb,(D_emb,M))
-            #k2 = np.tile(r2[None,:,:],(K,1,1))
-            k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
-            self.Vs = np.concatenate([k1,k2],axis=1)
+            mask1 = np.hstack((np.eye(D_acc),np.ones((D_acc,M-self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc,D_acc)),np.ones((D_acc,M-self.Mphys))))
         else:
-            # set input Accumulation params, each Mphys inputs are accumulated on one
-            # dimension in opposite directions
-            # rest of M-D inputs are applied to each dimension
-            r1 = np.hstack((self._betas,np.zeros((1,M-self.Mphys))))
-            r2 = np.reshape(self._betas_emb,(D_emb,M))
-            k1 = np.vstack((r1[None,:,:], np.zeros((K-1,D_acc,M))))
-            #k2 = np.tile(r2[None,:,:],(K,1,1))
-            k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
-            self.Vs = np.concatenate([k1,k2],axis=1)
+            mask1 = np.hstack((np.ones((D_acc,self.Mphys)),np.ones((D_acc,M-self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc,self.Mphys)),np.ones((D_acc,M-self.Mphys))))
+        r1 = np.reshape(self._betas,(D_acc,M)) * mask1
+        k1 = np.vstack((r1[None,:,:], (r1*mask2)[None,:,:], (r1*mask2)[None,:,:]))
+        r2 = np.reshape(self._betas_emb,(D_emb,M))
+        
+        k2 = np.tile(r2[None,:,:],(K,1,1))
+        #k2 = np.vstack((r2[None,:,:], np.zeros((K-1,D_emb,M))))
+        self.Vs = np.concatenate([k1,k2],axis=1)
        
-       
+        
 
         # update sigmas
         mask1 = np.vstack( (np.ones(D,), np.zeros((K-1,D))) )
@@ -881,12 +925,21 @@ class DecisionEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObserv
             # logP_dec = np.log(1/np.sqrt(2*np.pi*self.sigma_decision**2))-1/2*(wT-mus[:,-1] @ H)*1/self.sigma_decision**2*wT-mus[:,-1] @ H   
             # ll_dec = np.zeros((ll_ar.shape[0]-1,ll_ar.shape[1]))
             # ll_decision = np.row_stack((ll_dec,logP_dec))
-            decision = tag
-            wT = np.zeros((D,1))
-            wT[decision] = 1
-            H = np.zeros((D,D))
-            H[0,0] = 1
-            H[1,1] = 1
+          
+            wt = []
+            for d in range(self.D):
+                if d == tag:
+                    wt.append(1)
+                else:
+                    wt.append(0)
+            wT = np.array(wt)[:,None]
+            # H = np.zeros((self.D,self.D))
+            # H[0,0] = 1
+            # H[1,1] = 1
+            h1 = np.eye(self.D_acc,self.D)
+            h2 = np.zeros((self.D_emb,self.D))
+            H = np.vstack((h1,h2))
+            
             logP_dec = np.array([np.squeeze(np.log(2*np.pi**(-D/2)*np.linalg.det(self.sigma_decision)) -\
                 0.5*(wT- (H @ mu[-1])[:,None]).T @ np.linalg.inv(self.sigma_decision) @ (wT- (H @ mu[-1])[:,None])) \
                 for mu in mus])[None,:]
@@ -925,11 +978,12 @@ class DecisionEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObserv
         J_dyn_22 = np.sum(Ez[1:,:,None,None] * inv_Sigmas[None,:], axis=1)
         
         # # Add final J for decision
-        Hs = np.zeros((inv_Sigmas.shape[0],data.shape[1],data.shape[1]))
-        Hs[:,0,0] = 1
-        Hs[:,1,1] = 1
+        h1 = np.eye(self.D_acc,self.D)
+        h2 = np.zeros((self.D_emb,self.D))
+        H = np.vstack((h1,h2))
+        
         blocks = np.array([-1.0 * H @ np.linalg.inv(self.sigma_decision) @ H
-                            for H in Hs])
+                            for _ in range(self.K)])
         J_dec = np.sum(Ez[-1,:,None,None] * blocks, axis=0)
         J_dyn_22[-1] += -J_dec
 
@@ -942,11 +996,18 @@ class DecisionEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObserv
     
     def Rchoice_likelihood(self,x,q_Sigmas):
         # ll_decision = np.row_stack((ll_dec,logP_dec))
-        wTR = np.array([0,1,0,0])[:,None]
-        wTL = np.array([1,0,0,0])[:,None]
-        H = np.zeros((self.D,self.D))
-        H[0,0] = 1
-        H[1,1] = 1
+        # wTR = np.array([0,1,0,0])[:,None]
+        # wTL = np.array([1,0,0,0])[:,None]
+        
+        wT = np.eye(self.D_acc,self.D)
+        wTL = wT[0,:,None]
+        wTR = wT[1,:,None]
+        # H = np.zeros((self.D,self.D))
+        # H[0,0] = 1
+        # H[1,1] = 1
+        h1 = np.eye(self.D_acc,self.D)
+        h2 = np.zeros((self.D_emb,self.D))
+        H = np.vstack((h1,h2))
         
         P_R = 2*np.pi**(-self.D/2)*np.linalg.det(self.sigma_decision) *\
             np.exp(-0.5*(wTR - (H @ x[-1])[:,None]).T @ np.linalg.inv(self.sigma_decision) @ (wTR - (H @ x[-1])[:,None]))
@@ -1056,6 +1117,571 @@ class DecisionEmbeddedAccumulationObservations(AutoRegressiveDiagonalNoiseObserv
     def m_step(self, expectations, datas, inputs, masks, tags, 
                 continuous_expectations=None, **kwargs):
         Observations.m_step(self, expectations, datas, inputs, masks, tags, **kwargs)
+
+
+class DAWEmbeddedCascadedAccumulationObservations(AutoRegressiveDiagonalNoiseObservations):
+    def __init__(self, K, D, M, cascades=1, D_emb=None, D_acc=None, Mphys=2, learn_V=True):
+        super().__init__(K, D, M)
+
+        # cascades now acts as the cascade depth (N) per accumulation dimension
+        self.cascades = cascades
+        self.D_acc = D_acc
+        self.D_emb = D_emb
+        
+        # Total accumulation dimension expands by the cascade depth (cascades)
+        self.D_acc_total = D_acc * cascades
+        assert self.D_emb + self.D_acc_total == D, "accum (scaled by cascades) + emb dims must equal total dims D"
+        
+        self.D = D
+        self.M = M
+        self.K = K
+        self.Mphys = Mphys
+
+        # Learnable decay rate for the cascade stages
+        self._a_diag = np.ones((D_acc, 1))
+        
+        # Initialize stable diagonal eigenvalues for embedded dimensions
+        self._a_emb = np.random.uniform(low=0.9, high=0.95, size=(D_emb,)) * np.eye(D_emb)
+
+        # Build the cascade transition matrix for accumulation dimensions
+        # Each accumulator channel is a chain of length `cascades` with rate -a on diagonal and +a on sub-diagonal
+        acc_blocks = []
+        for d in range(D_acc):
+            rate = self._a_diag[d, 0]
+            
+            # Build rows as standard Python lists to avoid in-place numpy assignment errors with Box objects
+            rows = []
+            for i in range(cascades):
+                row = [0.0] * cascades
+                row[i] = rate         # Diagonal element
+                if i > 0:
+                    row[i - 1] = 1 - rate   # Sub-diagonal element
+                rows.append(row)
+                
+            # Convert list of rows into an array (Autograd will trace this cleanly)
+            block = np.array(rows)
+            acc_blocks.append(block)
+        
+        # Combine blocks using block_diag (or handle D_acc == 1)
+        if D_acc > 1:
+            # Build block diagonal structure safely without scipy.linalg.block_diag
+            n_blocks = len(acc_blocks)
+            block_rows = []
+            for i in range(n_blocks):
+                row_parts = []
+                for j in range(n_blocks):
+                    if i == j:
+                        row_parts.append(acc_blocks[i])
+                    else:
+                        shape_i = acc_blocks[i].shape
+                        shape_j = acc_blocks[j].shape
+                        row_parts.append(np.zeros((shape_i[0], shape_j[1])))
+                block_rows.append(np.hstack(row_parts))
+            A_acc_cascade = np.vstack(block_rows)
+        else:
+            A_acc_cascade = acc_blocks[0]
+
+        # Assemble state transition matrix for the accumulation regime (State 0)
+        top_rows = np.hstack((A_acc_cascade, np.zeros((self.D_acc_total, D_emb))))
+        bottom_rows = np.hstack((np.zeros((D_emb, self.D_acc_total)), self._a_emb))
+        Aaccstate = np.vstack((top_rows, bottom_rows))
+        
+        # Decision states (Regimes > 0): accumulation dynamics freeze or transition (Identity or fixed decay)
+        top_rows_dec = np.hstack((np.eye(self.D_acc_total), np.zeros((self.D_acc_total, D_emb))))
+        Adecstate = np.vstack((top_rows_dec, bottom_rows))
+        
+        mask1 = np.vstack((Aaccstate[None, :, :], np.zeros((K - 1, D, D))))
+        mask2 = np.vstack((np.zeros((1, D, D)), np.tile(Adecstate, (K - 1, 1, 1))))
+        self._As = mask1 + mask2
+        
+        # Free parameters for inputs
+        self._betas = 0.1 * np.ones(D_acc * M,)
+        self._betas_emb = 0.1 * np.ones(D_emb * M,)
+        
+        # Construct input mixing matrices (Vs)
+        # Inputs only enter the FIRST stage of each accumulator cascade
+        # Rebuild input matrix with cascade positioning safely for Autograd
+        r1_base = np.reshape(self._betas, (D_acc, M))
+        
+        cascade_rows = []
+        for d in range(D_acc):
+            # Add the active input row for the first stage of this accumulator cascade
+            cascade_rows.append(r1_base[d, :])
+            # Add (lags - 1) rows of zeros for the intermediate buffer stages
+            for _ in range(self.cascades - 1):
+                cascade_rows.append(np.zeros(M))
+                
+        # Combine into a single array cleanly
+        r1_cascade = np.vstack(cascade_rows)
+        
+        if D_acc > 1:
+            mask1 = np.hstack((np.eye(D_acc), np.ones((D_acc, M - self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc, D_acc)), np.ones((D_acc, M - self.Mphys))))
+        else:
+            mask1 = np.hstack((np.ones((D_acc, self.Mphys)), np.ones((D_acc, M - self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc, self.Mphys)), np.ones((D_acc, M - self.Mphys))))
+        
+        # Expand masks to match cascade dimensions
+        mask1_cascade = np.repeat(mask1, cascades, axis=0)
+        mask2_cascade = np.repeat(mask2, cascades, axis=0)
+        
+        r1 = r1_cascade * mask1_cascade
+        k1 = np.vstack((r1[None, :, :], (r1 * mask2_cascade)[None, :, :], (r1 * mask2_cascade)[None, :, :]))
+        
+        r2 = np.reshape(self._betas_emb, (D_emb, M))
+        k2 = np.tile(r2[None, :, :], (K, 1, 1))
+        self.Vs = np.concatenate([k1, k2], axis=1)
+
+        # Set noise variances
+        self.accum_log_sigmasq = np.log(1e-3) * np.ones(D,)
+        mask_noise1 = np.vstack((np.ones(D,), np.zeros((K - 1, D))))
+        mask_noise2 = np.vstack((np.zeros(D), np.ones((K - 1, D))))
+        self.bound_variance = 1e-4
+        self._log_sigmasq = self.accum_log_sigmasq * mask_noise1 + np.log(self.bound_variance) * mask_noise2
+        self._log_sigmasq_init = (self.accum_log_sigmasq + np.log(2)) * mask_noise1 + np.log(self.bound_variance) * mask_noise2
+
+        # Set remaining parameters to fixed values
+        self.bs = np.zeros((K, D))
+        acc_mu_init = np.zeros((1, D))
+        self.mu_init = np.vstack((acc_mu_init, np.ones((K - 1, D))))
+
+    @property
+    def params(self):
+        return self._betas, self._betas_emb, self.accum_log_sigmasq, self._a_diag, self._a_emb
+
+    @params.setter
+    def params(self, value):
+        self._betas, self._betas_emb, self.accum_log_sigmasq, self._a_diag, self._a_emb = value
+        K, D, M, D_acc, D_emb, cascades = self.K, self.D, self.M, self.D_acc, self.D_emb, self.cascades
+
+        # Rebuild cascade A and V matrices during parameter updates
+        acc_blocks = []
+        for d in range(D_acc):
+            rate = self._a_diag[d, 0]
+            
+            # Build rows as standard Python lists to avoid in-place numpy assignment errors with Box objects
+            rows = []
+            for i in range(cascades):
+                row = [0.0] * cascades
+                row[i] = rate         # Diagonal element
+                if i > 0:
+                    row[i - 1] = 1 - rate   # Sub-diagonal element
+                rows.append(row)
+                
+            # Convert list of rows into an array (Autograd will trace this cleanly)
+            block = np.array(rows)
+            acc_blocks.append(block)
+        
+        if D_acc > 1:
+            # Build block diagonal structure safely without scipy.linalg.block_diag
+            n_blocks = len(acc_blocks)
+            block_rows = []
+            for i in range(n_blocks):
+                row_parts = []
+                for j in range(n_blocks):
+                    if i == j:
+                        row_parts.append(acc_blocks[i])
+                    else:
+                        shape_i = acc_blocks[i].shape
+                        shape_j = acc_blocks[j].shape
+                        row_parts.append(np.zeros((shape_i[0], shape_j[1])))
+                block_rows.append(np.hstack(row_parts))
+            A_acc_cascade = np.vstack(block_rows)
+        else:
+            A_acc_cascade = acc_blocks[0]
+            
+        top_rows = np.hstack((A_acc_cascade, np.zeros((self.D_acc_total, D_emb))))
+        bottom_rows = np.hstack((np.zeros((D_emb, self.D_acc_total)), self._a_emb))
+        Aaccstate = np.vstack((top_rows, bottom_rows))
+        
+        top_rows_dec = np.hstack((np.eye(self.D_acc_total), np.zeros((self.D_acc_total, D_emb))))
+        Adecstate = np.vstack((top_rows_dec, bottom_rows))
+        
+        mask1 = np.vstack((Aaccstate[None, :, :], np.zeros((K - 1, D, D))))
+        mask2 = np.vstack((np.zeros((1, D, D)), np.tile(Adecstate, (K - 1, 1, 1))))
+        self._As = mask1 + mask2
+
+        # Update input matrices Vs with cascade positioning
+        r1_base = np.reshape(self._betas, (D_acc, M))
+        cascade_rows = []
+        for d in range(D_acc):
+            # Add the active input row for the first stage of this accumulator cascade
+            cascade_rows.append(r1_base[d, :])
+            # Add (lags - 1) rows of zeros for intermediate buffer stages
+            for _ in range(self.cascades - 1):
+                cascade_rows.append(np.zeros(M)) # Use anp.zeros to stay compatible with autograd tracing
+        
+        r1_cascade = np.vstack(cascade_rows)
+
+        if D_acc > 1:
+            mask1 = np.hstack((np.eye(D_acc), np.ones((D_acc, M - self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc, D_acc)), np.ones((D_acc, M - self.Mphys))))
+        else:
+            mask1 = np.hstack((np.ones((D_acc, self.Mphys)), np.ones((D_acc, M - self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc, self.Mphys)), np.ones((D_acc, M - self.Mphys))))
+        
+        mask1_cascade = np.repeat(mask1, cascades, axis=0)
+        mask2_cascade = np.repeat(mask2, cascades, axis=0)
+        
+        r1 = r1_cascade * mask1_cascade
+        k1 = np.vstack((r1[None, :, :], (r1 * mask2_cascade)[None, :, :], (r1 * mask2_cascade)[None, :, :]))
+        r2 = np.reshape(self._betas_emb, (D_emb, M))
+        k2 = np.tile(r2[None, :, :], (K, 1, 1))
+        self.Vs = np.concatenate([k1, k2], axis=1)
+
+        # Update noise variances
+       
+        mask_noise1 = np.vstack((np.ones(D,), np.zeros((K - 1, D))))
+        mask_noise2 = np.vstack((np.zeros(D), np.ones((K - 1, D))))
+        # DAW ADDED
+        #min_variance = 1e-5
+        #self._log_sigmasq = (self.accum_log_sigmasq + min_variance) * mask_noise1 + np.log(self.bound_variance) * mask_noise2
+        self._log_sigmasq = self.accum_log_sigmasq * mask_noise1 + np.log(self.bound_variance) * mask_noise2
+        self._log_sigmasq_init = (self.accum_log_sigmasq + np.log(2)) * mask_noise1 + np.log(self.bound_variance) * mask_noise2
+
+    def Rchoice_likelihood(self, x, q_Sigmas):
+        q_stds = np.array([np.sqrt(np.diag(q_Sigma)) for q_Sigma in q_Sigmas])
+        delta = x[-1, 0] - x[-1, 1]
+        z = delta / (np.sqrt(q_stds[-1, 0] * q_stds[-1, 1]))
+        prob = 0.5 * (1 + erf(z))
+        eps = 1e-12
+        prob = np.clip(prob, eps, 1 - eps)
+        return 1 - prob
+    
+    def Rchoice_likelihoods(self, xs, q_Sigmass):
+        prob = np.zeros((len(xs),))
+        for i, (x, q_Sigmas) in enumerate(zip(xs, q_Sigmass)):
+            prob[i] = self.Rchoice_likelihood(x, q_Sigmas[2])
+        return prob
+
+    def log_prior(self):
+        alpha = 1.1
+        beta = 1e-3
+        dyn_vars = np.exp(self.accum_log_sigmasq)
+        var_prior = np.sum(-(alpha + 1) * np.log(dyn_vars) - np.divide(beta, dyn_vars))
+        return var_prior
+
+    def initialize(self, datas, inputs=None, masks=None, tags=None):
+        pass
+    
+    def m_step(self, expectations, datas, inputs, masks, tags, continuous_expectations=None, **kwargs):
+        Observations.m_step(self, expectations, datas, inputs, masks, tags, **kwargs)
+
+
+    
+class DecisionCascadedAccumulationObservations(AutoRegressiveDiagonalNoiseObservations):
+    def __init__(self, K, D, M, cascades=1, D_emb=None, D_acc=None, Mphys=2,sig_dec=0.01, learn_V=True):
+        super().__init__(K, D, M)
+
+        # cascades now acts as the cascade depth (N) per accumulation dimension
+        self.cascades = cascades
+        self.D_acc = D_acc
+        self.D_emb = D_emb
+
+        
+        self.dx = 0.25
+        self.dt = 0.02
+        self.epsilon = 10e-10
+        self.total_rate = 30
+        
+        # Total accumulation dimension expands by the cascade depth (cascades)
+        self.D_acc_total = D_acc * cascades
+        assert self.D_emb + self.D_acc_total == D, "accum (scaled by cascades) + emb dims must equal total dims D"
+        
+        self.D = D
+        self.M = M
+        self.K = K
+        self.Mphys = Mphys
+
+        # Learnable decay rate for the cascade stages
+        self._a_diag = 0.95*np.ones((D_acc, 1))
+        
+        # Initialize stable diagonal eigenvalues for embedded dimensions
+        self._a_emb = np.random.uniform(low=0.9, high=0.95, size=(D_emb,)) * np.eye(D_emb)
+
+        # Initialize decision model for the final decision stage
+        self.sig_dec = sig_dec
+        decdims = [(d+1) * self.cascades - 1 for d in range(self.D_acc)]
+        self.decisions = DecisionModel(self.D_acc,self.D,self.sig_dec, decdims)
+
+        # Build the cascade transition matrix for accumulation dimensions
+        # Each accumulator channel is a chain of length `cascades` with rate -a on diagonal and +a on sub-diagonal
+        acc_blocks = []
+        for d in range(D_acc):
+            rate = self._a_diag[d, 0]
+            
+            # Build rows as standard Python lists to avoid in-place numpy assignment errors with Box objects
+            rows = []
+            for i in range(cascades):
+                row = [0.0] * cascades
+                row[i] = rate         # Diagonal element
+                if i > 0:
+                    row[i - 1] = 1 - rate   # Sub-diagonal element
+                rows.append(row)
+                
+            # Convert list of rows into an array (Autograd will trace this cleanly)
+            block = np.array(rows)
+            acc_blocks.append(block)
+        
+        # Combine blocks using block_diag (or handle D_acc == 1)
+        if D_acc > 1:
+            # Build block diagonal structure safely without scipy.linalg.block_diag
+            n_blocks = len(acc_blocks)
+            block_rows = []
+            for i in range(n_blocks):
+                row_parts = []
+                for j in range(n_blocks):
+                    if i == j:
+                        row_parts.append(acc_blocks[i])
+                    else:
+                        shape_i = acc_blocks[i].shape
+                        shape_j = acc_blocks[j].shape
+                        row_parts.append(np.zeros((shape_i[0], shape_j[1])))
+                block_rows.append(np.hstack(row_parts))
+            A_acc_cascade = np.vstack(block_rows)
+        else:
+            A_acc_cascade = acc_blocks[0]
+
+        # Assemble state transition matrix for the accumulation regime (State 0)
+        top_rows = np.hstack((A_acc_cascade, np.zeros((self.D_acc_total, D_emb))))
+        bottom_rows = np.hstack((np.zeros((D_emb, self.D_acc_total)), self._a_emb))
+        Aaccstate = np.vstack((top_rows, bottom_rows))
+        
+        # Decision states (Regimes > 0): accumulation dynamics freeze or transition (Identity or fixed decay)
+        top_rows_dec = np.hstack((np.eye(self.D_acc_total), np.zeros((self.D_acc_total, D_emb))))
+        Adecstate = np.vstack((top_rows_dec, bottom_rows))
+        
+        mask1 = np.vstack((Aaccstate[None, :, :], np.zeros((K - 1, D, D))))
+        mask2 = np.vstack((np.zeros((1, D, D)), np.tile(Adecstate, (K - 1, 1, 1))))
+        self._As = mask1 + mask2
+        
+        # Free parameters for inputs
+        self._betas = 0.1 * np.ones(D_acc * M,)
+        self._betas_emb = 0.1 * np.ones(D_emb * M,)
+        
+        # Construct input mixing matrices (Vs)
+        # Inputs only enter the FIRST stage of each accumulator cascade
+        # Rebuild input matrix with cascade positioning safely for Autograd
+        r1_base = np.reshape(self._betas, (D_acc, M))
+        
+        cascade_rows = []
+        for d in range(D_acc):
+            # Add the active input row for the first stage of this accumulator cascade
+            cascade_rows.append(r1_base[d, :])
+            # Add (lags - 1) rows of zeros for the intermediate buffer stages
+            for _ in range(self.cascades - 1):
+                cascade_rows.append(np.zeros(M))
+                
+        # Combine into a single array cleanly
+        r1_cascade = np.vstack(cascade_rows)
+        
+        if D_acc > 1:
+            mask1 = np.hstack((np.eye(D_acc), np.ones((D_acc, M - self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc, D_acc)), np.ones((D_acc, M - self.Mphys))))
+        else:
+            mask1 = np.hstack((np.ones((D_acc, self.Mphys)), np.ones((D_acc, M - self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc, self.Mphys)), np.ones((D_acc, M - self.Mphys))))
+        
+        # Expand masks to match cascade dimensions
+        mask1_cascade = np.repeat(mask1, cascades, axis=0)
+        mask2_cascade = np.repeat(mask2, cascades, axis=0)
+        
+        r1 = r1_cascade * mask1_cascade
+        k1 = np.vstack((r1[None, :, :], (r1 * mask2_cascade)[None, :, :], (r1 * mask2_cascade)[None, :, :]))
+        
+        r2 = np.reshape(self._betas_emb, (D_emb, M))
+        mask_emb = np.hstack((np.zeros((D_emb,self.Mphys)),np.ones((D_emb,M-self.Mphys))))
+        k2 = np.tile((r2*mask_emb)[None, :, :], (K, 1, 1))
+        self.Vs = np.concatenate([k1, k2], axis=1)
+        
+        # Set noise variances
+        self.accum_log_sigmasq = np.log(1e-3) * np.ones(D,)
+        mask_noise1 = np.vstack((np.ones(D,), np.zeros((K - 1, D))))
+        mask_noise2 = np.vstack((np.zeros(D), np.ones((K - 1, D))))
+        self.bound_variance = 1e-4
+        self._log_sigmasq = self.accum_log_sigmasq * mask_noise1 + np.log(self.bound_variance) * mask_noise2
+        self._log_sigmasq_init = (self.accum_log_sigmasq + np.log(2)) * mask_noise1 + np.log(self.bound_variance) * mask_noise2
+
+        # Set remaining parameters to fixed values
+        self.bs = np.zeros((K, D))
+        acc_mu_init = np.zeros((1, D))
+        self.mu_init = np.vstack((acc_mu_init, np.ones((K - 1, D))))
+
+    @property
+    def params(self):
+        return self._betas, self._betas_emb, self.accum_log_sigmasq, self._a_diag, self._a_emb
+
+    @params.setter
+    def params(self, value):
+        self._betas, self._betas_emb, self.accum_log_sigmasq, self._a_diag, self._a_emb = value
+        K, D, M, D_acc, D_emb, cascades = self.K, self.D, self.M, self.D_acc, self.D_emb, self.cascades
+
+        # Rebuild cascade A and V matrices during parameter updates
+        acc_blocks = []
+        for d in range(D_acc):
+            rate = self._a_diag[d, 0]
+            
+            # Build rows as standard Python lists to avoid in-place numpy assignment errors with Box objects
+            rows = []
+            for i in range(cascades):
+                row = [0.0] * cascades
+                row[i] = rate         # Diagonal element
+                if i > 0:
+                    row[i - 1] = 1 - rate   # Sub-diagonal element
+                rows.append(row)
+                
+            # Convert list of rows into an array (Autograd will trace this cleanly)
+            block = np.array(rows)
+            acc_blocks.append(block)
+        
+        if D_acc > 1:
+            # Build block diagonal structure safely without scipy.linalg.block_diag
+            n_blocks = len(acc_blocks)
+            block_rows = []
+            for i in range(n_blocks):
+                row_parts = []
+                for j in range(n_blocks):
+                    if i == j:
+                        row_parts.append(acc_blocks[i])
+                    else:
+                        shape_i = acc_blocks[i].shape
+                        shape_j = acc_blocks[j].shape
+                        row_parts.append(np.zeros((shape_i[0], shape_j[1])))
+                block_rows.append(np.hstack(row_parts))
+            A_acc_cascade = np.vstack(block_rows)
+        else:
+            A_acc_cascade = acc_blocks[0]
+            
+        top_rows = np.hstack((A_acc_cascade, np.zeros((self.D_acc_total, D_emb))))
+        bottom_rows = np.hstack((np.zeros((D_emb, self.D_acc_total)), self._a_emb))
+        Aaccstate = np.vstack((top_rows, bottom_rows))
+        
+        top_rows_dec = np.hstack((np.eye(self.D_acc_total), np.zeros((self.D_acc_total, D_emb))))
+        Adecstate = np.vstack((top_rows_dec, bottom_rows))
+        
+        mask1 = np.vstack((Aaccstate[None, :, :], np.zeros((K - 1, D, D))))
+        mask2 = np.vstack((np.zeros((1, D, D)), np.tile(Adecstate, (K - 1, 1, 1))))
+        self._As = mask1 + mask2
+        
+        # Update input matrices Vs with cascade positioning
+        r1_base = np.reshape(self._betas, (D_acc, M))
+        cascade_rows = []
+        for d in range(D_acc):
+            # Add the active input row for the first stage of this accumulator cascade
+            cascade_rows.append(r1_base[d, :])
+            # Add (lags - 1) rows of zeros for intermediate buffer stages
+            for _ in range(self.cascades - 1):
+                cascade_rows.append(np.zeros(M)) # Use anp.zeros to stay compatible with autograd tracing
+        
+        r1_cascade = np.vstack(cascade_rows)
+
+        if D_acc > 1:
+            mask1 = np.hstack((np.eye(D_acc), np.ones((D_acc, M - self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc, D_acc)), np.ones((D_acc, M - self.Mphys))))
+        else:
+            mask1 = np.hstack((np.ones((D_acc, self.Mphys)), np.ones((D_acc, M - self.Mphys))))
+            mask2 = np.hstack((np.zeros((D_acc, self.Mphys)), np.ones((D_acc, M - self.Mphys))))
+        
+        mask1_cascade = np.repeat(mask1, cascades, axis=0)
+        mask2_cascade = np.repeat(mask2, cascades, axis=0)
+        
+        r1 = r1_cascade * mask1_cascade
+        k1 = np.vstack((r1[None, :, :], (r1 * mask2_cascade)[None, :, :], (r1 * mask2_cascade)[None, :, :]))
+        r2 = np.reshape(self._betas_emb, (D_emb, M))
+        #mask_emb = np.hstack((np.zeros((D_emb,self.Mphys)),np.ones((D_emb,M-self.Mphys))))
+        k2 = np.tile((r2)[None, :, :], (K, 1, 1))
+        self.Vs = np.concatenate([k1, k2], axis=1)
+
+        # Update noise variances
+       
+        mask_noise1 = np.vstack((np.ones(D,), np.zeros((K - 1, D))))
+        mask_noise2 = np.vstack((np.zeros(D), np.ones((K - 1, D))))
+        # DAW ADDED
+        #min_variance = 1e-5
+        #self._log_sigmasq = (self.accum_log_sigmasq + min_variance) * mask_noise1 + np.log(self.bound_variance) * mask_noise2
+        self._log_sigmasq = self.accum_log_sigmasq * mask_noise1 + np.log(self.bound_variance) * mask_noise2
+        self._log_sigmasq_init = (self.accum_log_sigmasq + np.log(2)) * mask_noise1 + np.log(self.bound_variance) * mask_noise2
+       
+
+    def log_prior(self):
+        alpha = 1.1
+        beta = 1e-3
+        dyn_vars = np.exp(self.accum_log_sigmasq)
+        var_prior = np.sum(-(alpha + 1) * np.log(dyn_vars) - np.divide(beta, dyn_vars))
+        
+        # 3. Example: Add a prior on decay rates (_a_diag) to keep them close to a desired stability
+        decay_prior_weight = 0.01
+        decay_penalty = -decay_prior_weight * np.sum((self._a_diag - 0.9) ** 2)
+        
+        return var_prior + decay_penalty
+
+    def initialize(self, datas, inputs=None, masks=None, tags=None):
+        pass
+    
+    
+    def log_likelihoods(self, data, input, mask, tag=None):
+        assert np.all(mask), "Cannot compute likelihood of autoregressive observations with missing data."
+        L = self.lags
+        T, D = data.shape
+        K = self.K
+        
+    
+        # 1. Compute AR means per discrete state
+        mus = self._compute_mus(data, input, mask, tag)  # shape: K x T x D
+        
+       
+        ll_init = np.column_stack([
+            stats.multivariate_normal_logpdf(data[:L], mu[:L], Sigma)
+            for mu, Sigma in zip(mus, self.Sigmas_init)
+        ])
+    
+        ll_ar = np.column_stack([
+            stats.multivariate_normal_logpdf(data[L:], mu[L:], Sigma)
+            for mu, Sigma in zip(mus, self.Sigmas)
+        ])
+
+        # Choice likelihood
+        ll_decision = self.decisions.log_likelihoods(mus, input, mask, tag)
+        
+        ll = np.row_stack((ll_init, ll_ar)) + ll_decision  # shape (T, K)
+       
+        return ll
+    
+    def neg_hessian_expected_log_dynamics_prob(self, Ez, data, input, mask, tag=None):
+        assert np.all(mask), "Cannot compute negative Hessian of autoregressive obsevations with missing data."
+        assert self.lags == 1, "Does not compute negative Hessian of autoregressive observations with lags > 1"
+
+        # initial distribution contributes a Gaussian term to first diagonal block
+        J_ini = np.sum(Ez[0, :, None, None] * np.linalg.inv(self.Sigmas_init), axis=0)
+
+        # first part is transition dynamics - goes to all terms except final one
+        # E_q(z) x_{t} A_{z_t+1}.T Sigma_{z_t+1}^{-1} A_{z_t+1} x_{t}
+        inv_Sigmas = np.linalg.inv(self.Sigmas)
+        dynamics_terms = np.array([A.T@inv_Sigma@A for A, inv_Sigma in zip(self.As, inv_Sigmas)]) # A^T Qinv A terms
+        J_dyn_11 = np.sum(Ez[1:,:,None,None] * dynamics_terms[None,:], axis=1)
+
+        # second part of diagonal blocks are inverse covariance matrices - goes to all but first time bin
+        # E_q(z) x_{t+1} Sigma_{z_t+1}^{-1} x_{t+1}
+        J_dyn_22 = np.sum(Ez[1:,:,None,None] * inv_Sigmas[None,:], axis=1)
+        
+        # # Add final J for decision
+        Hs = np.array([self.decisions.H for _ in range(self.K)])
+        blocks = np.array([-1.0 * H @ np.linalg.inv(self.decisions.sigma_decision) @ H
+                            for H in Hs])
+        J_dec = np.sum(Ez[-1,:,None,None] * blocks, axis=0)
+        J_dyn_22[-1] += -J_dec
+
+        # lower diagonal blocks are (T-1,D,D):
+        # E_q(z) x_{t+1} Sigma_{z_t+1}^{-1} A_{z_t+1} x_t
+        off_diag_terms = np.array([inv_Sigma@A for A, inv_Sigma in zip(self.As, inv_Sigmas)])
+        J_dyn_21 = -1 * np.sum(Ez[1:,:,None,None] * off_diag_terms[None,:], axis=1)
+        
+        return J_ini, J_dyn_11, J_dyn_21, J_dyn_22
+    
+    
+    def m_step(self, expectations, datas, inputs, masks, tags, continuous_expectations=None, **kwargs):
+        Observations.m_step(self, expectations, datas, inputs, masks, tags, **kwargs)
+        
         
 class UrgencyGatingObservations(AutoRegressiveDiagonalNoiseObservations):
     def __init__(self, K, D, M, lags=1, D_emb=None, D_acc=None, Mphys=2,learn_V=True):
